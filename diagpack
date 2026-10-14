@@ -1,0 +1,503 @@
+#!/usr/bin/env bash
+set -uo pipefail
+umask 077
+
+#TODO
+# The filesystem walk compares device IDs to avoid crossing mount points. Bind mounts can share a device ID with
+# their source, so the walk may still enter some nested mounts despite the intended fuctionality.
+# figure out how to parse /proc/self/mountinfo and prune directories that are mount targets,
+# or compare Linux mount IDs.
+
+UPLOAD_HW_PROBE=0
+EXTENDED_HW_CHECK=0
+CAPTURE_TIMEOUT=300
+OUT_BASE=/var/tmp
+STAGE=
+SOS_ARGS=()
+
+usage() {
+    cat <<'EOF'
+Usage: sudo -E diagpack [options]
+
+Options:
+  --extended-hw-check   Run hw-probe's -check-extended option (if supported)
+  --upload-hw-probe     Upload the saved hw-probe package with -upload -src
+  --sos-args ARGS...    Pass remaining arguments to sos report or sosreport.
+                        Must be last; example: --sos-args --all-logs
+  -h, --help            Show this help
+
+By default, collection is local. --upload-hw-probe explicitly uploads the
+saved hw-probe package. No packages are installed.
+
+Output is written to the user's home directory. /home and /root are excluded
+from the filesystem index and raw-log copy.
+
+Core-dump contents are not collected. Crash metadata and kernel debug-symbol
+availability are recorded, but core dumps are not analyzed and symbols are
+not loaded. The script does not run tracing or stress-test workloads.
+This is a unified diagnostic collector, NOT A DEBUGGER.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+    --extended-hw-check) EXTENDED_HW_CHECK=1 ;;
+    --upload-hw-probe) UPLOAD_HW_PROBE=1 ;;
+    --sos-args)
+        shift
+        SOS_ARGS=("$@")
+        break
+        ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    *)
+        echo "Unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+    shift
+done
+
+if [[ "$(uname -s)" != Linux ]]; then
+    echo "This collector supports GNU/Linux only." >&2
+    exit 2
+fi
+
+for required in tar zstd python3 find stat cp sha256sum sort xargs getent; do
+    if ! command -v "$required" >/dev/null 2>&1; then
+        echo "Required command missing: $required (not installing it)." >&2
+        exit 1
+    fi
+done
+
+if ! tar --version 2>&1 | grep -q 'GNU tar'; then
+    echo "GNU tar is required for the archive metadata options." >&2
+    exit 1
+fi
+
+if ((EUID != 0)); then
+    echo "Note: not running as root; some logs and hardware details may be inaccessible." >&2
+fi
+
+HOST="$(hostname -s 2>/dev/null || printf 'linux')"
+HOST="${HOST//[^A-Za-z0-9._-]/_}"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+ARCHIVE="$OUT_BASE/diagpack-${HOST}-${STAMP}-$$.tar.zst"
+STAGE="$(mktemp -d "$OUT_BASE/diagpack.XXXXXX")" || exit 1
+
+cleanup() {
+    if [[ -n "$STAGE" && -d "$STAGE" ]]; then
+        rm -rf -- "$STAGE"
+    fi
+}
+trap cleanup EXIT
+
+mkdir -p \
+    "$STAGE"/{manifest,system,filesystem,logs/journal,logs/kernel,logs/files,hardware/hw-probe,sos/archives,crashes,debug,tools,work}
+
+: >"$STAGE/manifest/command-status.tsv"
+printf 'UTC collection time: %s\nHost: %s\nKernel: %s\n' \
+    "$STAMP" "$HOST" "$(uname -r)" >"$STAGE/manifest/summary.txt"
+
+# Run a command to a named file; continue even if a tool is missing or fails.
+capture() {
+    local rel="$1"
+    shift
+    local out="$STAGE/$rel"
+    local exe="$1"
+    local rc=0
+
+    mkdir -p -- "$(dirname -- "$out")"
+    {
+        printf 'Command:'
+        printf ' %q' "$@"
+        printf '\n'
+    } >"$out"
+
+    if ! command -v "$exe" >/dev/null 2>&1; then
+        printf 'SKIPPED: command not found: %s\n' "$exe" >>"$out"
+        rc=127
+    elif command -v timeout >/dev/null 2>&1; then
+        timeout "$CAPTURE_TIMEOUT" "$@" >>"$out" 2>&1
+        rc=$?
+    else
+        "$@" >>"$out" 2>&1
+        rc=$?
+    fi
+
+    printf '\n[diagpack exit status: %s]\n' "$rc" >>"$out"
+    printf '%s\t%s\n' "$rel" "$rc" >>"$STAGE/manifest/command-status.tsv"
+    return 0
+}
+
+# Package inventory, if a supported package manager is present.
+if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+fi
+distro="${ID:-} ${ID_LIKE:-}"
+distro="${distro,,}"
+
+case "$distro" in
+*debian* | *ubuntu*)
+    if command -v dpkg-query >/dev/null 2>&1; then
+        capture system/packages.txt dpkg-query -W \
+            '-f=${binary:Package}\t${Version}\n'
+    else
+        printf 'dpkg-query not found for detected distro: %s\n' "$distro" \
+            >"$STAGE/system/packages.txt"
+    fi
+    ;;
+*arch*)
+    if command -v pacman >/dev/null 2>&1; then
+        capture system/packages.txt pacman -Q
+    else
+        printf 'pacman not found for detected distro: %s\n' "$distro" \
+            >"$STAGE/system/packages.txt"
+    fi
+    ;;
+*fedora* | *rhel* | *centos* | *rocky* | *almalinux* | *opensuse* | *suse*)
+    if command -v rpm >/dev/null 2>&1; then
+        capture system/packages.txt rpm -qa \
+            --qf '%{NAME}\t%{VERSION}-%{RELEASE}.%{ARCH}\n'
+    else
+        printf 'rpm not found for detected distro: %s\n' "$distro" \
+            >"$STAGE/system/packages.txt"
+    fi
+    ;;
+*alpine*)
+    if command -v apk >/dev/null 2>&1; then
+        capture system/packages.txt apk info -vv
+    else
+        printf 'apk not found for detected distro: %s\n' "$distro" \
+            >"$STAGE/system/packages.txt"
+    fi
+    ;;
+*)
+    printf 'Unrecognized distro; package inventory skipped. ID=%s ID_LIKE=%s\n' \
+        "${ID:-}" "${ID_LIKE:-}" >"$STAGE/system/packages.txt"
+    ;;
+esac
+
+# Basic system, storage, mount, and device inventory.
+capture system/os-release.txt cat /etc/os-release
+capture system/uname.txt uname -a
+capture system/uptime.txt uptime
+capture system/hostname.txt hostnamectl status
+capture system/failed-units.txt systemctl --failed --no-pager --full
+capture system/findmnt.json findmnt --json --output TARGET,SOURCE,FSTYPE,OPTIONS
+capture system/lsblk.json lsblk --json --fs
+capture system/df.txt df -hT
+capture system/pci.txt lspci -nnk
+capture system/usb.txt lsusb
+
+# Journal warnings/errors from the current and previous boots.
+# journalctl -p warning includes warning and more severe priorities.
+capture logs/journal/current-boot-warning-and-higher.txt \
+    journalctl --no-pager --utc -b 0 -p warning -o short-iso
+capture logs/journal/previous-boot-warning-and-higher.txt \
+    journalctl --no-pager --utc -b -1 -p warning -o short-iso
+capture logs/kernel/current-boot-warning-and-higher.txt \
+    journalctl --no-pager --utc -k -b 0 -p warning -o short-iso
+capture logs/kernel/previous-boot-warning-and-higher.txt \
+    journalctl --no-pager --utc -k -b -1 -p warning -o short-iso
+capture logs/kernel/dmesg.txt dmesg --ctime
+capture logs/rasdaemon-journal.txt \
+    journalctl --no-pager --utc -u rasdaemon -p warning
+
+# Copy selected text/syslog files only; skip auth logs, journal binary files,
+# home directories, and individual files larger than 128 MiB.
+: >"$STAGE/logs/raw-copy-notes.txt"
+if [[ -d /var/log ]]; then
+    find /var/log -maxdepth 3 -type f \
+        \( -name 'syslog*' -o -name 'messages*' -o -name 'kern.log*' \
+        -o -name 'boot.log*' -o -name 'Xorg.*.log' \) -print0 \
+        2>>"$STAGE/logs/raw-copy-notes.txt" |
+        while IFS= read -r -d '' src; do
+            size="$(stat -c '%s' -- "$src" 2>/dev/null || printf '0')"
+            if [[ "$size" =~ ^[0-9]+$ ]] && ((size <= 134217728)); then
+                rel="${src#/}"
+                dest="$STAGE/logs/files/$rel"
+                mkdir -p -- "$(dirname -- "$dest")"
+                cp -a -- "$src" "$dest" 2>>"$STAGE/logs/raw-copy-notes.txt" ||
+                    printf 'COPY FAILED: %s\n' "$src" >>"$STAGE/logs/raw-copy-notes.txt"
+            else
+                printf 'SKIPPED (over 128 MiB or size unavailable): %s\n' "$src" \
+                    >>"$STAGE/logs/raw-copy-notes.txt"
+            fi
+        done
+fi
+
+# Filesystem/path metadata only, not file contents. Deliberately does not walk
+# /home, /root, pseudo-filesystems, or across nested filesystem mount points.
+python3 - "$STAGE/filesystem/path-index.jsonl" \
+    2>"$STAGE/filesystem/path-index-errors.txt" <<'PY'
+import json
+import os
+import stat
+import sys
+
+out_path = sys.argv[1]
+roots = ["/etc", "/usr", "/var/log", "/var/lib/systemd", "/boot", "/opt"]
+limit = 250_000
+count = 0
+truncated = False
+
+def emit(path, st, out):
+    global count, truncated
+    if count >= limit:
+        truncated = True
+        return False
+    mode = stat.S_IMODE(st.st_mode)
+    if stat.S_ISDIR(st.st_mode):
+        kind = "dir"
+    elif stat.S_ISREG(st.st_mode):
+        kind = "file"
+    elif stat.S_ISLNK(st.st_mode):
+        kind = "symlink"
+    else:
+        kind = "other"
+
+    item = {
+        "path": path,
+        "type": kind,
+        "mode": format(mode, "04o"),
+        "uid": st.st_uid,
+        "gid": st.st_gid,
+        "size": st.st_size,
+        "mtime_ns": st.st_mtime_ns,
+        "device": st.st_dev,
+    }
+    if kind == "symlink":
+        try:
+            item["link_target"] = os.readlink(path)
+        except OSError:
+            pass
+    out.write(json.dumps(item, ensure_ascii=True) + "\n")
+    count += 1
+    return True
+
+def onerror(exc):
+    print(str(exc), file=sys.stderr)
+
+with open(out_path, "w", encoding="utf-8") as out:
+    for root in roots:
+        try:
+            root_st = os.lstat(root)
+        except OSError as exc:
+            print(f"{root}: {exc}", file=sys.stderr)
+            continue
+
+        emit(root, root_st, out)
+        base_dev = root_st.st_dev
+
+        for current, dirs, files in os.walk(
+            root, topdown=True, followlinks=False, onerror=onerror
+        ):
+            keep = []
+            for name in list(dirs):
+                path = os.path.join(current, name)
+                try:
+                    st = os.lstat(path)
+                except OSError as exc:
+                    print(f"{path}: {exc}", file=sys.stderr)
+                    continue
+                if not emit(path, st, out):
+                    truncated = True
+                    break
+                # Don't descend through symlinks or into another mounted FS.
+                if stat.S_ISDIR(st.st_mode) and st.st_dev == base_dev:
+                    keep.append(name)
+            dirs[:] = keep
+            if truncated:
+                break
+
+            for name in files:
+                path = os.path.join(current, name)
+                try:
+                    st = os.lstat(path)
+                except OSError as exc:
+                    print(f"{path}: {exc}", file=sys.stderr)
+                    continue
+                if not emit(path, st, out):
+                    truncated = True
+                    break
+            if truncated:
+                break
+        if truncated:
+            break
+
+if truncated:
+    print(f"TRUNCATED at {limit} path entries", file=sys.stderr)
+PY
+
+# Crash metadata only. Raw core files/vmcores are not copied.
+capture crashes/coredump-list.txt coredumpctl --no-pager list
+capture crashes/kdump-service.txt systemctl status kdump.service --no-pager --full
+capture crashes/crash-file-index.txt \
+    find /var/crash /var/lib/systemd/coredump -maxdepth 3 -type f \
+    -printf '%p\t%s bytes\t%TY-%Tm-%TdT%TH:%TM:%TS\n'
+
+# Report kernel debug-symbol availability only; do not analyze core dumps.
+{
+    kver="$(uname -r)"
+    printf 'Kernel debug-symbol availability (no core-dump analysis performed)\n'
+    printf 'Running kernel: %s\n\n' "$kver"
+
+    for path in \
+        "/usr/lib/debug/boot/vmlinux-$kver" \
+        "/usr/lib/debug/lib/modules/$kver/vmlinux" \
+        "/boot/vmlinux-$kver"; do
+        if [[ -e "$path" ]]; then
+            if command -v file >/dev/null 2>&1; then
+                file -- "$path"
+            else
+                printf 'PRESENT: %s (file command unavailable)\n' "$path"
+            fi
+        else
+            printf 'MISSING: %s\n' "$path"
+        fi
+    done
+
+    printf '\nInstalled debug-symbol package names, if queryable:\n'
+    if command -v rpm >/dev/null 2>&1; then
+        rpm -qa | grep -Ei 'debuginfo|debugsource' || true
+    elif command -v dpkg-query >/dev/null 2>&1; then
+        dpkg-query -W '-f=${binary:Package}\t${Version}\n' '*-dbgsym' 2>&1 || true
+    fi
+} >"$STAGE/debug/kernel-symbol-availability.txt" 2>&1
+
+# Record availability; don't launch target-specific tracers or stress tests.
+{
+    for tool in hw-probe sos sosreport coredumpctl kdump crash gdb \
+        readelf eu-readelf strace perf bpftrace stress-ng memtester \
+        rasdaemon smartctl nvme sensors; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            printf '%s\t%s\n' "$tool" "$(command -v "$tool")"
+        else
+            printf '%s\tMISSING\n' "$tool"
+        fi
+    done
+} >"$STAGE/tools/availability.tsv"
+
+capture tools/strace-version.txt strace --version
+capture tools/perf-version.txt perf --version
+capture tools/bpftrace-version.txt bpftrace --version
+capture tools/stress-ng-version.txt stress-ng --version
+capture tools/readelf-version.txt readelf --version
+capture tools/eu-readelf-version.txt eu-readelf --version
+
+# sos is optional. Keep its generated archive inside this bundle as a nested
+# artifact; don't enable --all-logs by default.
+SOS_TMP="$STAGE/work/sos"
+mkdir -p "$SOS_TMP"
+if command -v sos >/dev/null 2>&1; then
+    CAPTURE_TIMEOUT=1800
+    capture sos/run.log sos report --batch --tmp-dir "$SOS_TMP" \
+        --skip-files='/home/*,/root/*' "${SOS_ARGS[@]}"
+    CAPTURE_TIMEOUT=300
+elif command -v sosreport >/dev/null 2>&1; then
+    CAPTURE_TIMEOUT=1800
+    capture sos/run.log sosreport --batch --tmp-dir "$SOS_TMP" \
+        --skip-files='/home/*,/root/*' "${SOS_ARGS[@]}"
+    CAPTURE_TIMEOUT=300
+else
+    printf 'sos/sosreport not installed; skipped.\n' >"$STAGE/sos/run.log"
+fi
+
+while IFS= read -r -d '' sos_file; do
+    mv -- "$sos_file" "$STAGE/sos/archives/"
+done < <(find "$SOS_TMP" -maxdepth 1 -type f -print0 2>/dev/null)
+
+rm -rf -- "$STAGE/work"
+
+# hw-probe: local collection first. Upload, if requested, is a separate
+# explicit step using the saved probe package.
+if command -v hw-probe >/dev/null 2>&1; then
+    hw_help="$STAGE/hardware/hw-probe/help.txt"
+    hw-probe -help >"$hw_help" 2>&1 || true
+    mkdir "$STAGE/hardware/hw-probe/saved"
+    hw_args=(-all -dump-acpi -decode-acpi -max -save "$STAGE/hardware/hw-probe/saved")
+    if ((EXTENDED_HW_CHECK)); then
+        if grep -Fq -- '-check-extended' "$hw_help"; then
+            hw_args+=(-check-extended)
+        else
+            printf 'Installed hw-probe help does not advertise -check-extended; not run.\n' \
+                >"$STAGE/hardware/hw-probe/extended-check.txt"
+        fi
+    fi
+
+    CAPTURE_TIMEOUT=900
+    capture hardware/hw-probe/run.log hw-probe "${hw_args[@]}"
+    CAPTURE_TIMEOUT=300
+    capture hardware/hw-probe/show-verbose.txt hw-probe -show -verbose
+
+    if ((UPLOAD_HW_PROBE)); then
+        probe_pkg="$(find "$STAGE/hardware/hw-probe/saved" -type f \
+            \( -name '*.txz' -o -name '*.tar.xz' -o -name '*.tar.gz' \) \
+            -print -quit 2>/dev/null || true)"
+        if [[ -n "$probe_pkg" ]]; then
+            capture hardware/hw-probe/upload.log hw-probe -upload -src "$probe_pkg"
+            cat "$STAGE/hardware/hw-probe/upload.log"
+        else
+            printf 'No saved hw-probe package found; nothing uploaded.\n'
+        fi
+    fi
+else
+    printf 'hw-probe not installed; skipped.\n' >"$STAGE/hardware/hw-probe/run.log"
+fi
+
+# Inventory the staged files before packing.
+(
+    cd "$STAGE" || exit 1
+    find . -type f ! -path './manifest/files.sha256' -print0 |
+        sort -z |
+        xargs -0 -r sha256sum >manifest/files.sha256
+)
+
+# One outer zstd archive; preserve numeric owners, ACLs, xattrs, and SELinux
+# labels where supported by GNU tar.
+if ! tar --format=pax --numeric-owner --acls --xattrs --selinux \
+    --sort=name -cf - -C "$STAGE" . |
+    zstd -T0 -q -o "$ARCHIVE"; then
+    echo "Archive creation failed." >&2
+    exit 1
+fi
+
+chmod 640 "$ARCHIVE"
+if ! zstd -t "$ARCHIVE"; then
+    echo "Archive validation failed: $ARCHIVE" >&2
+    exit 1
+fi
+
+(
+    cd -- "$(dirname -- "$ARCHIVE")" &&
+        sha256sum "$(basename -- "$ARCHIVE")"
+) >"$ARCHIVE.sha256"
+
+target_user="$(id -un)"
+if ((EUID == 0)) && [[ -n ${SUDO_USER:-} ]]; then
+    target_user="$SUDO_USER"
+fi
+
+if ! passwd_entry="$(getent passwd "$target_user")"; then
+    echo "Cannot find account: $target_user" >&2
+    exit 1
+fi
+
+IFS=: read -r _ _ _ _ _ target_home _ <<<"$passwd_entry"
+if [[ -z "$target_home" || ! -d "$target_home" ]]; then
+    echo "Invalid home directory for $target_user: $target_home" >&2
+    exit 1
+fi
+
+if ((EUID == 0)); then
+    target_group="$(id -gn "$target_user")" || exit 1
+    chown -- "$target_user:$target_group" "$ARCHIVE" "$ARCHIVE.sha256" || exit 1
+fi
+
+mv -- "$ARCHIVE" "$target_home/" || exit 1
+mv -- "$ARCHIVE.sha256" "$target_home/" || exit 1
+echo "$target_home/"
